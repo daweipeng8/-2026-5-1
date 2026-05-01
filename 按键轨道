@@ -1,0 +1,241 @@
+#include <Arduino.h>
+#include <FastLED.h>
+#include <USB.h>
+#include <USBHIDKeyboard.h>
+
+// ========== 继电器引脚 ==========
+#define RELAY_1       2    // 红灯  (HIGH吸合,初始LOW)
+#define RELAY_2       1    // 绿灯  (HIGH吸合,初始LOW)
+#define RELAY_15      15   // 第5路 (HIGH吸合,初始LOW)
+
+// ========== 按键 ==========
+#define BUTTON_PIN    4
+
+// ========== LED 灯带 ==========
+#define NUM_LEDS_1    20
+#define NUM_LEDS_2    18
+#define DATA_PIN_1    21
+#define DATA_PIN_2    47
+#define BRIGHTNESS    255
+
+// ========== 时间节点 (ms) ==========
+#define T_KEY_1        2000UL         // 发送键 '1'  (0秒,按键按下即发送)
+#define T_IO15_ON      2000UL      // IO15 吸合
+#define T_IO15_OFF     2500UL      // IO15 断开
+#define T_KEY_W1       9000UL     // 发送键 'w'  (16秒)
+#define T_KEY_S1       29000UL     // 发送键 '2'  (31秒)
+#define T_IO1_ON       56000UL     // 红灯吸合
+#define T_KEY_3        56000UL     // 发送键 '3'
+#define T_IO1_OFF      69000UL     // 红灯断开
+#define T_IO2_ON       69000UL     // 绿灯吸合
+#define T_IO2_OFF      92000UL     // 绿灯断开
+#define T_KEY_4        92000UL    // 发送键 '4'
+#define T_KEY_S2       127000UL    // 发送键 's'  (145秒)
+#define T_RESET        147000UL    // 全部复位
+
+CRGB leds1[NUM_LEDS_1];
+CRGB leds2[NUM_LEDS_2];
+
+USBHIDKeyboard Keyboard;
+
+enum SysState { STATE_IDLE, STATE_RUNNING };
+SysState state = STATE_IDLE;
+
+unsigned long startTime = 0;
+
+bool done_IO15_on  = false;
+bool done_IO15_off = false;
+bool done_IO1_on   = false;
+bool done_IO1_off  = false;
+bool done_IO2_on   = false;
+bool done_IO2_off  = false;
+bool done_key_1    = false;
+bool done_key_w1   = false;
+bool done_key_s1   = false;
+bool done_key_3    = false;
+bool done_key_4    = false;
+bool done_key_s2   = false;
+
+// ---------- 继电器初始化 ----------
+void setAllRelaysInit() {
+  digitalWrite(RELAY_1,  LOW);
+  digitalWrite(RELAY_2,  LOW);
+  digitalWrite(RELAY_15, LOW);
+}
+
+// ---------- 灯带全亮（白色）----------
+void allLedsOn() {
+  fill_solid(leds1, NUM_LEDS_1, CRGB::White);
+  fill_solid(leds2, NUM_LEDS_2, CRGB::White);
+  FastLED.show();
+}
+
+void resetAllFlags() {
+  done_IO15_on  = false;
+  done_IO15_off = false;
+  done_IO1_on   = false;
+  done_IO1_off  = false;
+  done_IO2_on   = false;
+  done_IO2_off  = false;
+  done_key_1    = false;
+  done_key_w1   = false;
+  done_key_s1   = false;
+  done_key_3    = false;
+  done_key_4    = false;
+  done_key_s2   = false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  
+  pinMode(RELAY_1,  OUTPUT);
+  pinMode(RELAY_2,  OUTPUT);
+  pinMode(RELAY_15, OUTPUT);
+  setAllRelaysInit();
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // 灯带初始化并直接全亮
+  FastLED.addLeds<WS2812B, DATA_PIN_1, GRB>(leds1, NUM_LEDS_1);
+  FastLED.addLeds<WS2812B, DATA_PIN_2, GRB>(leds2, NUM_LEDS_2);
+  FastLED.setBrightness(BRIGHTNESS);
+  allLedsOn();   // 上电立即全亮，常亮
+  
+  // USB HID 键盘初始化
+  Keyboard.begin();
+  USB.begin();
+  delay(1500);
+  
+  Serial.println("======================================");
+  Serial.println("  系统就绪  灯带已全亮(常亮)");
+  Serial.println("  按下 IO4 按键启动时序");
+  Serial.println("  0s   : 键盘发送 '1'");
+  Serial.println("  5s   : IO15 吸合");
+  Serial.println("  5.5s : IO15 断开");
+  Serial.println("  16s  : 键盘发送 'w'");
+  Serial.println("  31s  : 键盘发送 's'");
+  Serial.println("  59s  : 红灯吸合 + 键盘发送 '3'");
+  Serial.println("  71s  : 红灯断开 + 绿灯吸合");
+  Serial.println("  95s  : 绿灯断开");
+  Serial.println("  100s : 键盘发送 '4'");
+  Serial.println("  145s : 键盘发送 's'");
+  Serial.println("  160s : 继电器复位 (灯带保持常亮)");
+  Serial.println("======================================");
+}
+
+void loop() {
+  static bool lastBtn = HIGH;
+  
+  if (state == STATE_IDLE) {
+    bool nowBtn = digitalRead(BUTTON_PIN);
+    if (lastBtn == HIGH && nowBtn == LOW) {
+      delay(20);
+      if (digitalRead(BUTTON_PIN) == LOW) {
+        Serial.printf("\n>>>>>>>>>>  时序启动  (t=%lu ms)  <<<<<<<<<<\n", millis());
+        state = STATE_RUNNING;
+        startTime = millis();
+        resetAllFlags();
+      }
+    }
+    lastBtn = nowBtn;
+  }
+  else if (state == STATE_RUNNING) {
+    unsigned long elapsed = millis() - startTime;
+    
+    // 0s : 发送 '1'（按键按下立即发送）
+    if (!done_key_1 && elapsed >= T_KEY_1) {
+      Keyboard.print('1');
+      Serial.printf("[%6lums] USB键盘发送: '1'\n", elapsed);
+      done_key_1 = true;
+    }
+    
+    // 5s : IO15 HIGH
+    if (!done_IO15_on && elapsed >= T_IO15_ON) {
+      digitalWrite(RELAY_15, HIGH);
+      Serial.printf("[%6lums] IO15 -> HIGH  第5路吸合\n", elapsed);
+      done_IO15_on = true;
+    }
+    
+    // 5.5s : IO15 LOW
+    if (!done_IO15_off && elapsed >= T_IO15_OFF) {
+      digitalWrite(RELAY_15, LOW);
+      Serial.printf("[%6lums] IO15 -> LOW   第5路断开\n", elapsed);
+      done_IO15_off = true;
+    }
+    
+    // 16s : 发送 'w'
+    if (!done_key_w1 && elapsed >= T_KEY_W1) {
+      Keyboard.print('w');
+      Serial.printf("[%6lums] USB键盘发送: 'w'\n", elapsed);
+      done_key_w1 = true;
+    }
+    
+    // 31s : 发送 '2'
+    if (!done_key_s1 && elapsed >= T_KEY_S1) {
+      Keyboard.print('2');
+      Serial.printf("[%6lums] USB键盘发送: '2'\n", elapsed);
+      done_key_s1 = true;
+    }
+    
+    // 59s : IO1 HIGH 红灯吸合 + 发送 '3'
+    if (!done_IO1_on && elapsed >= T_IO1_ON) {
+      digitalWrite(RELAY_1, HIGH);
+      Serial.printf("[%6lums] IO1  -> HIGH  红灯吸合\n", elapsed);
+      done_IO1_on = true;
+    }
+    if (!done_key_3 && elapsed >= T_KEY_3) {
+      Keyboard.print('3');
+      Serial.printf("[%6lums] USB键盘发送: '3'\n", elapsed);
+      done_key_3 = true;
+    }
+    
+    // 71s : IO1 LOW 红灯断开
+    if (!done_IO1_off && elapsed >= T_IO1_OFF) {
+      digitalWrite(RELAY_1, LOW);
+      Serial.printf("[%6lums] IO1  -> LOW   红灯断开\n", elapsed);
+      done_IO1_off = true;
+
+      
+    }
+    
+    // 71s : IO2 HIGH 绿灯吸合
+    if (!done_IO2_on && elapsed >= T_IO2_ON) {
+      digitalWrite(RELAY_2, HIGH);
+      Serial.printf("[%6lums] IO2  -> HIGH  绿灯吸合\n", elapsed);
+      done_IO2_on = true;
+    }
+    
+    // 95s : IO2 LOW 绿灯断开
+    if (!done_IO2_off && elapsed >= T_IO2_OFF) {
+      digitalWrite(RELAY_2, LOW);
+      Serial.printf("[%6lums] IO2  -> LOW   绿灯断开\n", elapsed);
+      done_IO2_off = true;
+    }
+    
+    // 100s : 发送 '4'
+    if (!done_key_4 && elapsed >= T_KEY_4) {
+      Keyboard.print('4');
+      Serial.printf("[%6lums] USB键盘发送: '4'\n", elapsed);
+      done_key_4 = true;
+    }
+    
+    // 145s : 发送 's'
+    if (!done_key_s2 && elapsed >= T_KEY_S2) {
+      Keyboard.print('s');
+      Serial.printf("[%6lums] USB键盘发送: 's'\n", elapsed);
+      done_key_s2 = true;
+    }
+    
+    // 160s : 继电器复位（灯带保持常亮不动）
+    if (elapsed >= T_RESET) {
+      setAllRelaysInit();
+      Serial.printf("[%6lums] 继电器复位  灯带保持常亮  等待下次按键\n", elapsed);
+      Serial.println("--------------------------------------\n");
+      state = STATE_IDLE;
+      lastBtn = digitalRead(BUTTON_PIN);
+    }
+  }
+  
+  delay(5);
+}
