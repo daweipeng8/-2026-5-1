@@ -1,0 +1,290 @@
+import os
+import sys
+import time
+import threading
+import serial
+import cv2
+import numpy as np
+import pygame
+
+# ======================= 配置区域 =======================
+
+SERIAL_PORT = "COM4"
+SERIAL_BAUD = 115200
+
+SCREEN_W = 1920
+SCREEN_H = 1200
+
+VIDEO_DIR = r"C:\Users\erica\Desktop\sixtouying\sixtouying\投影互动0413"
+
+# 格式: (x像素起点, y像素起点, 显示宽度, 显示高度, 主视频文件名, [触发信号列表])
+# 待机视频自动对应: 主文件名.mp4 -> 主文件名待机.mp4
+
+SLOT_CONFIGS = [
+    (732,    675,   440, 455, "模块投影盒子.mp4",  ["BTN_PRESS"]),               # 按键
+    (15,  671,   455, 524, "模块投影键盘.mp4",  ["KB_PRESS"]),                 # 机械键盘
+    (1462, 67,   449, 525, "模块投影盖章.mp4", ["HALL1_ON"]),                  # 霍尔1
+    (1460,    694, 450, 520, "模块投影冰箱.mp4",  ["HALL2_OFF"]),                 # 霍尔2
+    (728,  65, 465, 525, "模块投影六边形.mp4",  ["PRESSURE_ON"]),               # 压敏电阻
+    (29, 70, 420, 506, "模块投影座椅.mp4",  ["SWITCH_ON", "SWITCH_OFF"]),   # 开关
+]
+
+
+def make_idle_path(action_filename):
+    """根据主视频名生成待机视频名: 模块投影冰箱.mp4 -> 模块投影冰箱待机.mp4"""
+    base, ext = os.path.splitext(action_filename)
+    return base + "待机" + ext
+
+
+# ======================= 视频槽位类 =======================
+
+class VideoSlot:
+    """管理单个视频区域的播放状态：默认循环待机，触发时播放主动画"""
+
+    def __init__(self, x, y, w, h, action_path, idle_path, name=""):
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.action_path = action_path
+        self.idle_path = idle_path
+        self.name = name
+
+        self.action_playing = False      # 主动画是否正在播放
+        self._trigger_request = False    # 请求切换到主动画
+
+        self._frame_rgb = None
+        self._surface = None
+        self._dirty = False
+        self._lock = threading.Lock()
+
+        # 启动后台线程（常驻），默认循环播放待机动画
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def trigger(self):
+        """尝试触发主动画，正在播放时忽略"""
+        with self._lock:
+            if self.action_playing:
+                return False
+            self.action_playing = True
+            self._trigger_request = True
+        return True
+
+    def _run_loop(self):
+        """常驻循环：无触发时播放待机；收到触发则播放主动画，结束后回到待机"""
+        idle_exists = os.path.isfile(self.idle_path)
+        if not idle_exists:
+            print(f"  [提示] 待机视频不存在: {self.idle_path}（该槽位待机时将为黑屏）")
+
+        while True:
+            # 检查是否有触发请求
+            with self._lock:
+                play_action = self._trigger_request
+                self._trigger_request = False
+
+            if play_action:
+                self._play_video(self.action_path, is_action=True)
+                with self._lock:
+                    self.action_playing = False
+                    # 播放结束后，清空当前帧，回到待机由待机循环覆盖
+            else:
+                if idle_exists:
+                    self._play_video(self.idle_path, is_action=False)
+                else:
+                    # 没有待机视频：清空画面并等待触发
+                    with self._lock:
+                        self._frame_rgb = None
+                        self._dirty = True
+                    # 小睡一会避免忙等
+                    while True:
+                        time.sleep(0.05)
+                        with self._lock:
+                            if self._trigger_request:
+                                break
+
+    def _play_video(self, path, is_action=False):
+        """播放一个视频文件一次。待机播放时若检测到触发请求会提前中断"""
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            print(f"  [错误] 无法打开视频: {path}")
+            time.sleep(1)
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30.0
+        interval = 1.0 / fps
+
+        if is_action:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            print(f"  [▶ 主动画] {self.name}  ({total_frames}帧, {duration:.1f}秒, {fps:.0f}fps)")
+
+        while True:
+            t0 = time.perf_counter()
+
+            # 待机播放过程中，如果有触发请求，立即中断回到上层去播放主动画
+            if not is_action:
+                with self._lock:
+                    if self._trigger_request:
+                        break
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.resize(frame, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            with self._lock:
+                self._frame_rgb = frame
+                self._dirty = True
+
+            elapsed = time.perf_counter() - t0
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+
+        cap.release()
+
+        if is_action:
+            print(f"  [■ 主动画结束] {self.name}  -> 回到待机")
+
+    def draw(self, screen):
+        """主线程调用：把当前帧绘制到屏幕"""
+        with self._lock:
+            if self._dirty:
+                if self._frame_rgb is not None:
+                    self._surface = pygame.image.frombytes(
+                        self._frame_rgb.tobytes(),
+                        (self.w, self.h),
+                        "RGB"
+                    )
+                else:
+                    self._surface = None
+                self._dirty = False
+            surf = self._surface
+
+        if surf is not None:
+            screen.blit(surf, (self.x, self.y))
+
+
+# ======================= 串口读取线程 =======================
+
+def serial_reader(trigger_map, slots):
+    """持续读取串口，匹配信号并触发对应视频"""
+    while True:
+        try:
+            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+            print(f"[串口] 已连接 {SERIAL_PORT} @ {SERIAL_BAUD}")
+
+            while True:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+
+                if line in trigger_map:
+                    slot_idx = trigger_map[line]
+                    slot = slots[slot_idx]
+                    ok = slot.trigger()
+                    tag = "✓ 触发" if ok else "✗ 播放中,忽略"
+                    print(f"[信号] {line} -> {slot.name} ({tag})")
+                else:
+                    print(f"[串口] {line}")
+
+        except serial.SerialException as e:
+            print(f"[串口] 连接失败: {e}")
+            print(f"[串口] 3秒后重试...")
+            time.sleep(3)
+        except Exception as e:
+            print(f"[串口] 异常: {e}")
+            time.sleep(1)
+
+
+# ======================= 主程序 =======================
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.NOFRAME)
+    pygame.display.set_caption("投影互动系统")
+    pygame.mouse.set_visible(False)
+    clock = pygame.time.Clock()
+
+    # ---------- 构建视频槽位 & 触发映射 ----------
+    slots = []
+    trigger_map = {}
+
+    for x, y, w, h, filename, signals in SLOT_CONFIGS:
+        action_path = os.path.join(VIDEO_DIR, filename)
+        idle_path = os.path.join(VIDEO_DIR, make_idle_path(filename))
+        name = filename.replace(".mp4", "")
+        slot = VideoSlot(x, y, w, h, action_path, idle_path, name)
+        idx = len(slots)
+        slots.append(slot)
+        for sig in signals:
+            trigger_map[sig] = idx
+
+    # ---------- 打印启动信息 ----------
+    print("=" * 60)
+    print("       投影互动系统 启动（带待机动画）")
+    print("=" * 60)
+    print(f"  分辨率: {SCREEN_W} x {SCREEN_H}")
+    print(f"  视频目录: {VIDEO_DIR}")
+    print()
+    print("  槽位分布:")
+    for i, s in enumerate(slots):
+        a_ok = "✓" if os.path.isfile(s.action_path) else "✗"
+        i_ok = "✓" if os.path.isfile(s.idle_path) else "✗"
+        print(f"    [{i}] 起点({s.x},{s.y}) 尺寸{s.w}x{s.h}  {s.name}")
+        print(f"         主动画 {a_ok} {os.path.basename(s.action_path)}")
+        print(f"         待机   {i_ok} {os.path.basename(s.idle_path)}")
+    print()
+    print(f"  串口: {SERIAL_PORT} @ {SERIAL_BAUD}")
+    print(f"  按 ESC 退出 | 数字键 1-6 手动测试触发")
+    print("=" * 60)
+    print()
+
+    # ---------- 启动串口线程 ----------
+    t = threading.Thread(
+        target=serial_reader,
+        args=(trigger_map, slots),
+        daemon=True
+    )
+    t.start()
+
+    # ---------- 主渲染循环 ----------
+    running = True
+    while running:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    running = False
+
+                elif pygame.K_1 <= ev.key <= pygame.K_6:
+                    idx = ev.key - pygame.K_1
+                    if idx < len(slots):
+                        ok = slots[idx].trigger()
+                        tag = "✓ 触发" if ok else "✗ 播放中"
+                        print(f"[手动] 槽位{idx} {slots[idx].name} ({tag})")
+
+        screen.fill((0, 0, 0))
+
+        for slot in slots:
+            slot.draw(screen)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+    print("\n[系统] 已退出")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
