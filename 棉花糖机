@@ -1,0 +1,538 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+// ===================== 引脚定义 =====================
+static const int PIN_STICK_PWM   = 37;   // 棉花糖棒子旋转速度
+static const int PIN_SUGAR_PWM   = 38;   // 送糖机构旋转速度
+
+static const int PIN_PIPE_DIR1   = 35;
+static const int PIN_PIPE_DIR2   = 36;
+
+static const int PIN_LIMIT_TOP    = 4;
+static const int PIN_LIMIT_BOTTOM = 5;
+
+static const int PIN_BTN1 = 9;
+static const int PIN_BTN2 = 10;
+static const int PIN_BTN3 = 11;
+static const int PIN_BTN4 = 12;
+
+// ── 433MHz 遥控接收模块 4 路输出 ──
+static const int PIN_RF1 = 6;
+static const int PIN_RF2 = 7;
+static const int PIN_RF3 = 15;
+static const int PIN_RF4 = 16;
+static const int RF_ACTIVE_LEVEL = HIGH;
+
+static const int PIN_RELAY_ARM   = 14;   // 机械臂继电器
+static const int PIN_RELAY_POT   = 13;   // 棉花糖锅继电器
+
+static const int PIN_SERVO       = 39;   // 舵机
+
+// ===================== PWM 参数 =====================
+static const int PWM_FREQ     = 200;
+static const int PWM_RES      = 8;       // 0~255
+static const int PWM_CH_STICK = 0;
+static const int PWM_CH_SUGAR = 1;
+
+// 棒子 PWM 90% 占空比：round(255 * 0.9) = 230
+static const uint8_t STICK_PWM_90PCT = 230;
+static const uint8_t SUGAR_PWM_VALUE = 30;
+
+// ===================== 时序参数（可串口实时修改）=====================
+static uint32_t PIPE_UP_TIME_MS = 30000;   // 电机上行持续时间（舵机回90°后）
+static uint32_t STICK_EXTRA_MS  = 3000;   // 电机停止后棒子再转的时间
+
+// ===================== 限位监控参数 =====================
+static const uint32_t LIMIT_SAMPLE_MS = 200;  // 采样周期
+static bool  gLimitPeriodicLog = false;       // true=每次都打印, false=仅变化打印
+static uint8_t gTopLevel    = HIGH;
+static uint8_t gBottomLevel = HIGH;
+static uint32_t gLastLimitSample = 0;
+
+// ===================== 舵机 =====================
+Servo myServo;
+
+void servoWrite(int angle) {
+  myServo.write(angle);
+}
+
+// ===================== 全局互斥标志 =====================
+volatile bool gBusy = false;
+
+// ===================== BTN1 / RF1 状态机 =====================
+// 流程：
+//   ARM_RELAY_ON(500ms)         机械臂继电器吸合 500ms
+//   WAIT_16S(16s)               继电器断开，等 16 秒
+//   PIPE_DOWN                   电机下行，等待下限位
+//   (下限位触发 → 电机停, 棒子开启 PWM 90%, 舵机 75°)
+//   SERVO_75_500MS(500ms)       舵机保持 75° 共 500ms
+//   (舵机回 90°, 电机上行, 棒子继续转)
+//   PIPE_UP_TIMED(22s)          电机上行 22 秒, 到时电机停
+//   STICK_EXTRA_30S(30s)        棒子再转 30 秒后停止，流程结束
+enum Btn1State {
+  B1_IDLE = 0,
+  B1_ARM_RELAY_ON,       // 继电器吸合, 计时 500ms
+  B1_WAIT_16S,           // 继电器已断, 等 16s
+  B1_PIPE_DOWN,          // 电机下行, 等待下限位
+  B1_SERVO_75_500MS,     // 下限位到, 棒子开, 舵机 75°, 持续 500ms
+  B1_PIPE_UP_TIMED,      // 舵机回 90°, 电机上行 22s, 棒子继续转
+  B1_STICK_EXTRA_30S     // 电机已停, 棒子再转 30 秒
+};
+
+Btn1State    btn1State   = B1_IDLE;
+unsigned long b1Timer    = 0;      // 通用计时器
+
+// ===================== BTN2 状态机 =====================
+enum Btn2State {
+  B2_IDLE = 0,
+  B2_PIPE_DOWN,
+  B2_SERVO_95,
+  B2_SERVO_90_WAIT,
+  B2_PIPE_UP
+};
+
+Btn2State btn2State   = B2_IDLE;
+unsigned long b2Timer = 0;
+
+// ===================== 工具函数 =====================
+void setStickPWM(uint8_t duty) { ledcWrite(PWM_CH_STICK, duty); }
+void setSugarPWM(uint8_t duty) { ledcWrite(PWM_CH_SUGAR, duty); }
+
+void pipeStop() {
+  digitalWrite(PIN_PIPE_DIR1, LOW);
+  digitalWrite(PIN_PIPE_DIR2, LOW);
+}
+void pipeDown() {
+  digitalWrite(PIN_PIPE_DIR1, HIGH);
+  digitalWrite(PIN_PIPE_DIR2, LOW);
+}
+void pipeUp() {
+  digitalWrite(PIN_PIPE_DIR1, LOW);
+  digitalWrite(PIN_PIPE_DIR2, HIGH);
+}
+
+// 使用缓存的限位电平（由 updateLimits() 周期刷新）
+bool isTopLimitActive()    { return gTopLevel    == LOW; }
+bool isBottomLimitActive() { return gBottomLevel == LOW; }
+
+// ===================== 限位电平读取 + 串口上报 =====================
+void printLimitsStatus(const char *tag) {
+  Serial.print("[LIMIT] ");
+  Serial.print(tag);
+  Serial.print("  TOP=");
+  Serial.print(gTopLevel == LOW ? "LOW(触发)" : "HIGH(松开)");
+  Serial.print("   BOTTOM=");
+  Serial.println(gBottomLevel == LOW ? "LOW(触发)" : "HIGH(松开)");
+}
+
+void updateLimits() {
+  if (millis() - gLastLimitSample < LIMIT_SAMPLE_MS) return;
+  gLastLimitSample = millis();
+
+  uint8_t t = digitalRead(PIN_LIMIT_TOP);
+  uint8_t b = digitalRead(PIN_LIMIT_BOTTOM);
+
+  bool changed = (t != gTopLevel) || (b != gBottomLevel);
+  gTopLevel    = t;
+  gBottomLevel = b;
+
+  if (changed) {
+    printLimitsStatus("CHG");       // 电平变化立即打印
+  } else if (gLimitPeriodicLog) {
+    printLimitsStatus("---");       // 周期打印模式
+  }
+}
+
+// ===================== 系统停止 =====================
+void stopAll() {
+  setStickPWM(0);
+  setSugarPWM(0);
+  pipeStop();
+  digitalWrite(PIN_RELAY_ARM, LOW);
+  digitalWrite(PIN_RELAY_POT, LOW);
+  btn1State = B1_IDLE;
+  btn2State = B2_IDLE;
+  gBusy     = false;
+  Serial.println("[系统] 紧急停止：所有输出已关闭，流程已重置");
+}
+
+// ===================== BTN1 / RF1 流程启动 =====================
+void startBtn1Flow() {
+  if (gBusy) {
+    Serial.println("[BTN1] 当前有流程正在执行，忽略本次触发");
+    return;
+  }
+  gBusy       = true;
+  digitalWrite(PIN_RELAY_ARM, HIGH);   // 机械臂继电器吸合
+  b1Timer     = millis();
+  btn1State   = B1_ARM_RELAY_ON;
+  Serial.println("==============================");
+  Serial.println("[BTN1] *** 流程启动 ***");
+  Serial.println("[BTN1] 第1步：机械臂继电器吸合 → 500ms");
+  Serial.println("==============================");
+}
+
+// ===================== BTN1 状态机更新 =====================
+void updateBtn1StateMachine() {
+  switch (btn1State) {
+    case B1_IDLE:
+      break;
+
+    // ── 第1步：机械臂继电器吸合 500ms ──
+    case B1_ARM_RELAY_ON:
+      if (millis() - b1Timer >= 500) {
+        digitalWrite(PIN_RELAY_ARM, LOW);
+        b1Timer   = millis();
+        btn1State = B1_WAIT_16S;
+        Serial.println("[BTN1] 第2步：机械臂继电器断开 → 等待 16 秒");
+      }
+      break;
+
+    // ── 第2步：等 16 秒 ──
+    case B1_WAIT_16S:
+      if (millis() - b1Timer >= 16000) {
+        pipeDown();
+        btn1State = B1_PIPE_DOWN;
+        Serial.println("[BTN1] 第3步：16秒到 → 电机下行，等待下限位触发");
+      }
+      break;
+
+    // ── 第3步：电机下行，等待下限位 ──
+    case B1_PIPE_DOWN:
+      if (isBottomLimitActive()) {
+        pipeStop();
+        setStickPWM(STICK_PWM_90PCT);   // 棒子开始旋转 90%
+        servoWrite(75);                 // 舵机 75°
+        b1Timer   = millis();
+        btn1State = B1_SERVO_75_500MS;
+        Serial.println("[BTN1] 第4步：下限位触发 → 电机停止");
+        Serial.print  ("[BTN1]          棒子 PWM 开启 (");
+        Serial.print(STICK_PWM_90PCT);
+        Serial.println(" / 255, 90%)");
+        Serial.println("[BTN1]          舵机转至 75°，保持 500ms");
+      }
+      break;
+
+    // ── 第4步：舵机保持 75° 共 500ms ──
+    case B1_SERVO_75_500MS:
+      if (millis() - b1Timer >= 500) {
+        servoWrite(90);       // 舵机回 90°
+        pipeUp();             // 电机上行
+        b1Timer   = millis(); // 开始 22 秒计时
+        btn1State = B1_PIPE_UP_TIMED;
+        Serial.print("[BTN1] 第5步：舵机回 90° → 电机上行 ");
+        Serial.print(PIPE_UP_TIME_MS);
+        Serial.println(" ms（棒子继续旋转）");
+      }
+      break;
+-
+    // ── 第5步：电机上行定时 22 秒 ──
+    case B1_PIPE_UP_TIMED:
+      // 正常：定时到，停电机
+      if (millis() - b1Timer >= PIPE_UP_TIME_MS) {
+        pipeStop();                       // 电机停止
+        // 棒子保持旋转，不关闭 PWM
+        b1Timer   = millis();
+        btn1State = B1_STICK_EXTRA_30S;
+        Serial.print("[BTN1] 第6步：上行 ");
+        Serial.print(PIPE_UP_TIME_MS);
+        Serial.println(" ms 到 → 电机停止");
+        Serial.print("[BTN1]          棒子继续旋转，再转 ");
+        Serial.print(STICK_EXTRA_MS / 1000);
+        Serial.println(" 秒后停止");
+      }
+      // 安全冗余：若提前撞到上限位，也立即停电机防堵转
+      else if (isTopLimitActive()) {
+        pipeStop();
+        b1Timer   = millis();
+        btn1State = B1_STICK_EXTRA_30S;
+        Serial.println("[BTN1] 第6步：上限位提前触发（保护） → 电机停止");
+        Serial.print("[BTN1]          棒子继续旋转，再转 ");
+        Serial.print(STICK_EXTRA_MS / 1000);
+        Serial.println(" 秒后停止");
+      }
+      break;
+
+    // ── 第6步：电机已停，棒子再转 30 秒 ──
+    case B1_STICK_EXTRA_30S:
+      if (millis() - b1Timer >= STICK_EXTRA_MS) {
+        setStickPWM(0);                   // 关闭棒子 PWM
+        btn1State = B1_IDLE;
+        gBusy     = false;
+        Serial.print("[BTN1] 第7步：");
+        Serial.print(STICK_EXTRA_MS / 1000);
+        Serial.println(" 秒到 → 棒子 PWM 关闭");
+        Serial.println("==============================");
+        Serial.println("[BTN1] *** 流程结束，等待下次按键 ✓ ***");
+        Serial.println("==============================");
+      }
+      break;
+  }
+}
+
+// ===================== BTN2 流程启动 =====================
+void startBtn2Flow() {
+  if (gBusy) {
+    Serial.println("[BTN2] 当前有流程正在执行，忽略本次触发");
+    return;
+  }
+  gBusy     = true;
+  btn2State = B2_PIPE_DOWN;
+  pipeDown();
+  Serial.println("[BTN2] 流程启动 → 电机下行，等待下限位触发");
+}
+
+// ===================== BTN2 状态机更新 =====================
+void updateBtn2StateMachine() {
+  switch (btn2State) {
+    case B2_IDLE:
+      break;
+
+    case B2_PIPE_DOWN:
+      if (isBottomLimitActive()) {
+        pipeStop();
+        servoWrite(95);
+        b2Timer   = millis();
+        btn2State = B2_SERVO_95;
+        Serial.println("[BTN2] 下限位触发，电机停止");
+        Serial.println("[BTN2] 舵机转至 95° → 持续 3 秒");
+      }
+      break;
+
+    case B2_SERVO_95:
+      if (millis() - b2Timer >= 3000) {
+        servoWrite(90);
+        b2Timer   = millis();
+        btn2State = B2_SERVO_90_WAIT;
+        Serial.println("[BTN2] 舵机回到 90° → 等待 1 秒");
+      }
+      break;
+
+    case B2_SERVO_90_WAIT:
+      if (millis() - b2Timer >= 1000) {
+        pipeUp();
+        btn2State = B2_PIPE_UP;
+        Serial.println("[BTN2] 电机上行，等待上限位触发");
+      }
+      break;
+
+    case B2_PIPE_UP:
+      if (isTopLimitActive()) {
+        pipeStop();
+        btn2State = B2_IDLE;
+        gBusy     = false;
+        Serial.println("[BTN2] 上限位触发，电机停止");
+        Serial.println("[BTN2] 流程结束 ✓");
+      }
+      break;
+  }
+}
+
+// ===================== 按键/遥控 消抖（通用）=====================
+struct InputDebounce {
+  int pin;
+  int activeLevel;              // 按下时的电平
+  bool stableState;
+  bool lastRead;
+  unsigned long lastChange;
+  const char* name;
+  void (*onPress)();            // 按下回调
+};
+
+static const unsigned long DEBOUNCE_MS = 30;
+
+// 物理按键（低有效）
+InputDebounce btn1db{PIN_BTN1, LOW, HIGH, HIGH, 0, "BTN1", startBtn1Flow};
+InputDebounce btn2db{PIN_BTN2, LOW, HIGH, HIGH, 0, "BTN2", startBtn2Flow};
+InputDebounce btn3db{PIN_BTN3, LOW, HIGH, HIGH, 0, "BTN3", nullptr};
+InputDebounce btn4db{PIN_BTN4, LOW, HIGH, HIGH, 0, "BTN4", nullptr};
+
+// 433 遥控（默认高有效）
+InputDebounce rf1db{PIN_RF1, RF_ACTIVE_LEVEL, LOW, LOW, 0, "RF1", startBtn1Flow};
+InputDebounce rf2db{PIN_RF2, RF_ACTIVE_LEVEL, LOW, LOW, 0, "RF2", startBtn2Flow};
+InputDebounce rf3db{PIN_RF3, RF_ACTIVE_LEVEL, LOW, LOW, 0, "RF3", nullptr};
+InputDebounce rf4db{PIN_RF4, RF_ACTIVE_LEVEL, LOW, LOW, 0, "RF4", nullptr};
+
+void checkInput(InputDebounce &in) {
+  bool raw = digitalRead(in.pin);
+  if (raw != in.lastRead) {
+    in.lastRead   = raw;
+    in.lastChange = millis();
+  }
+  if ((millis() - in.lastChange) >= DEBOUNCE_MS) {
+    if (in.stableState != raw) {
+      in.stableState = raw;
+      if (in.stableState == in.activeLevel) {
+        Serial.print("[输入] ");
+        Serial.print(in.name);
+        Serial.println(" 触发");
+        if (in.onPress) in.onPress();
+      }
+    }
+  }
+}
+
+// ===================== 串口命令解析 =====================
+void handleSerialCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  if (cmd == "START") {
+    Serial.println("[串口] 启动主流程");
+    startBtn1Flow();
+  }
+  else if (cmd == "PIPE_DOWN") {
+    Serial.println("[串口] 收到指令：BTN2 流程");
+    startBtn2Flow();
+  }
+  else if (cmd == "HEATER_ON") {
+    digitalWrite(PIN_RELAY_ARM, HIGH);
+    Serial.println("[串口] 机械臂继电器已吸合");
+  }
+  else if (cmd == "HEATER_OFF") {
+    digitalWrite(PIN_RELAY_ARM, LOW);
+    Serial.println("[串口] 机械臂继电器已断开");
+  }
+  else if (cmd == "STOP_ALL") {
+    stopAll();
+  }
+  else if (cmd == "STATUS" || cmd == "LIMIT_STATUS") {
+    printLimitsStatus("NOW");
+  }
+  else if (cmd.startsWith("STICK_PWM:")) {
+    int v = constrain(cmd.substring(strlen("STICK_PWM:")).toInt(), 0, 255);
+    setStickPWM((uint8_t)v);
+    Serial.print("[串口] 棒子 PWM = ");
+    Serial.print(v); Serial.print(" / 255 (");
+    Serial.print((int)(v / 255.0f * 100 + 0.5f));
+    Serial.println("%)");
+  }
+  else if (cmd.startsWith("SUGAR_PWM:")) {
+    int v = constrain(cmd.substring(strlen("SUGAR_PWM:")).toInt(), 0, 255);
+    setSugarPWM((uint8_t)v);
+    Serial.print("[串口] 送糖 PWM = ");
+    Serial.print(v); Serial.print(" / 255 (");
+    Serial.print((int)(v / 255.0f * 100 + 0.5f));
+    Serial.println("%)");
+  }
+  else if (cmd.startsWith("UP_TIME:")) {
+    long v = cmd.substring(strlen("UP_TIME:")).toInt();
+    if (v > 0 && v < 600000L) {
+      PIPE_UP_TIME_MS = (uint32_t)v;
+      Serial.print("[串口] 电机上行时间 = ");
+      Serial.print(PIPE_UP_TIME_MS); Serial.println(" ms");
+    } else {
+      Serial.println("[串口] UP_TIME 范围 1 ~ 600000 ms");
+    }
+  }
+  else if (cmd.startsWith("EXTRA_TIME:")) {
+    long v = cmd.substring(strlen("EXTRA_TIME:")).toInt();
+    if (v > 0 && v < 600000L) {
+      STICK_EXTRA_MS = (uint32_t)v;
+      Serial.print("[串口] 棒子额外旋转时间 = ");
+      Serial.print(STICK_EXTRA_MS); Serial.println(" ms");
+    } else {
+      Serial.println("[串口] EXTRA_TIME 范围 1 ~ 600000 ms");
+    }
+  }
+  else if (cmd.startsWith("LIMIT_LOG:")) {
+    int v = cmd.substring(strlen("LIMIT_LOG:")).toInt();
+    gLimitPeriodicLog = (v != 0);
+    Serial.print("[串口] 限位周期打印 = ");
+    Serial.println(gLimitPeriodicLog ? "ON (每200ms打印一次)" : "OFF (仅变化打印)");
+  }
+  else {
+    Serial.print("[串口] 未知指令：");
+    Serial.println(cmd);
+  }
+}
+
+// ===================== setup =====================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_PIPE_DIR1,    OUTPUT);
+  pinMode(PIN_PIPE_DIR2,    OUTPUT);
+  pinMode(PIN_RELAY_ARM,    OUTPUT);
+  pinMode(PIN_RELAY_POT,    OUTPUT);
+
+  pinMode(PIN_LIMIT_TOP,    INPUT_PULLUP);
+  pinMode(PIN_LIMIT_BOTTOM, INPUT_PULLUP);
+
+  pinMode(PIN_BTN1, INPUT_PULLUP);
+  pinMode(PIN_BTN2, INPUT_PULLUP);
+  pinMode(PIN_BTN3, INPUT_PULLUP);
+  pinMode(PIN_BTN4, INPUT_PULLUP);
+
+  pinMode(PIN_RF1, INPUT);
+  pinMode(PIN_RF2, INPUT);
+  pinMode(PIN_RF3, INPUT);
+  pinMode(PIN_RF4, INPUT);
+
+  pipeStop();
+  digitalWrite(PIN_RELAY_ARM, LOW);
+  digitalWrite(PIN_RELAY_POT, LOW);
+
+  // PWM 通道初始化
+  ledcSetup(PWM_CH_STICK, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PIN_STICK_PWM, PWM_CH_STICK);
+  ledcSetup(PWM_CH_SUGAR, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PIN_SUGAR_PWM, PWM_CH_SUGAR);
+  setStickPWM(0);
+  setSugarPWM(0);
+
+  // 舵机初始化，归位 90°
+  ESP32PWM::allocateTimer(2);
+  myServo.setPeriodHertz(50);
+  myServo.attach(PIN_SERVO, 500, 2400);
+  servoWrite(90);
+
+  // 读取限位初始电平
+  gTopLevel    = digitalRead(PIN_LIMIT_TOP);
+  gBottomLevel = digitalRead(PIN_LIMIT_BOTTOM);
+
+  Serial.println("=============================");
+  Serial.println("  ESP32-S3 棉花糖机 启动完成");
+  Serial.println("=============================");
+  Serial.println("主流程 (BTN1 / RF1)：");
+  Serial.println(" 1) 机械臂继电器吸合 500ms");
+  Serial.println(" 2) 等待 16 秒");
+  Serial.println(" 3) 电机下行 → 下限位停止");
+  Serial.println(" 4) 棒子 PWM 开启 90% + 舵机 75° (500ms)");
+  Serial.println(" 5) 舵机回 90° → 电机上行 22 秒 (棒子继续转)");
+  Serial.println(" 6) 22 秒到 → 电机停止 (棒子仍在转)");
+  Serial.println(" 7) 棒子再转 30 秒 → 停止，流程结束");
+  Serial.println("-----------------------------");
+  Serial.println("串口: START / PIPE_DOWN / HEATER_ON / HEATER_OFF / STOP_ALL");
+  Serial.println("      STICK_PWM:<0~255> / SUGAR_PWM:<0~255>");
+  Serial.println("      UP_TIME:<ms> / EXTRA_TIME:<ms>");
+  Serial.println("      LIMIT_LOG:<0|1> / STATUS");
+  Serial.println("=============================");
+  printLimitsStatus("INIT");
+}
+
+// ===================== loop =====================
+void loop() {
+  // 时刻读取上下限位电平（周期采样+变化立即打印）
+  updateLimits();
+
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    handleSerialCommand(cmd);
+  }
+
+  // 物理按键
+  checkInput(btn1db);
+  checkInput(btn2db);
+  checkInput(btn3db);
+  checkInput(btn4db);
+
+  // 433 遥控
+  checkInput(rf1db);
+  checkInput(rf2db);
+  checkInput(rf3db);
+  checkInput(rf4db);
+
+  updateBtn1StateMachine();
+  updateBtn2StateMachine();
+}
